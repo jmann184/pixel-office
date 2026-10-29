@@ -1,6 +1,6 @@
 {
   "name": "pixel-office",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A pixel-art office pane: each chat gets its own building, named after its folder, with a crew that comes in to work as jobs get bigger",
   "types": "./types/index.d.ts"
 }

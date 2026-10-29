@@ -12,6 +12,8 @@ export type Worker = {
   atDesk: boolean
   movedAt: number
   isWalking: boolean
+  // What they're up to in the break room, while idle.
+  doing: string
 }
 
 // The whole building: named after the chat's folder.

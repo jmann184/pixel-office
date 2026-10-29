@@ -9,7 +9,7 @@ const PANE = 'pixel-office'
 // Change the tag when Board's fields change: it declines what an earlier
 // version stored, which outlives a reload.
 const board = atom({ plugin: 'pixel-office', key: 'board' } as const, { folder: '', workers: [] } as Board, {
-  shape: 'board-3',
+  shape: 'board-4',
 })
 
 const WALK_MS = 4500
@@ -17,7 +17,28 @@ const HELPER_LINGER_MS = 25_000
 const MAX_SLOTS = 12
 // How many actions in one reply bring in each extra crew member.
 const CREW_AT = [5, 15, 30]
-const NAMES = ['BEA', 'OTTO', 'MAE', 'RUFUS', 'IVY', 'GUS', 'NELL', 'FINN', 'LOLA', 'MILO', 'PIP', 'SAGE', 'ZED', 'MOSS', 'NOVA', 'RUNE']
+const NAMES = ['Bea', 'Otto', 'Mae', 'Rufus', 'Ivy', 'Gus', 'Nell', 'Finn', 'Lola', 'Milo', 'Pip', 'Sage', 'Zed', 'Moss', 'Nova', 'Rune']
+// What people get up to in the break room; each moves on to something else now and then.
+const PASTIMES = [
+  'Getting coffee',
+  'Raiding the fridge',
+  'Washing a mug',
+  'Thinking about lunch',
+  'Telling a bad joke',
+  'Stretching',
+  'Watering the plant',
+  'Daydreaming',
+  'Eating an apple',
+  'Planning the weekend',
+  'Humming a tune',
+  'Making toast',
+  'Checking the fridge again',
+  'Gossiping by the sink',
+  'Pretending to be busy',
+]
+const PASTIME_MS = 20_000
+// Where /office names keeps the person's own names, for every chat.
+const NAMES_KEY = 'names'
 const WORDS: Record<Status, string> = {
   idle: 'Idle',
   think: 'Thinking',
@@ -34,11 +55,15 @@ let folder = ''
 let lead: Person | undefined
 let crew: Person[] = []
 let helpers: Helper[] = []
+// The person's own names first, then the built-in ones shuffled.
+let pool: string[] = []
 let nextName = 0
 let actions = 0
 // The kinds of this reply's latest actions, newest first: the crew take the older ones.
 let recent: Status[] = []
 let lastBoard = ''
+// Each chat starts its people on different pastimes.
+const pastimeSeed = Math.floor(Math.random() * PASTIMES.length)
 
 function kindOf(tool: string): Status {
   if (/^(Read|Grep|Glob|WebFetch|WebSearch|LS)$/.test(tool)) return 'read'
@@ -58,7 +83,50 @@ function setStatus(p: Person, status: Status) {
 }
 
 const person = (name: string): Person => ({ name, status: 'idle', atDesk: false, movedAt: 0 })
-const takeName = () => NAMES[nextName++ % NAMES.length] ?? 'HELPER'
+const takeName = () => pool[nextName++ % pool.length] ?? 'Helper'
+
+async function ownNames($: EngineInterface): Promise<string[]> {
+  const saved = await $.store.get(NAMES_KEY)
+
+  return Array.isArray(saved) ? saved.filter((n): n is string => typeof n === 'string') : []
+}
+
+// Hand out names afresh: the lead first, then the crew, then any helpers.
+function nameEveryone(own: string[]) {
+  const rest = NAMES.filter(n => !own.some(o => o.toLowerCase() === n.toLowerCase()))
+  for (let j = rest.length - 1; j > 0; j--) {
+    const k = Math.floor(Math.random() * (j + 1))
+    ;[rest[j], rest[k]] = [rest[k] as string, rest[j] as string]
+  }
+  pool = [...own, ...rest]
+  nextName = 0
+  for (const p of [lead, ...crew, ...helpers]) if (p) p.name = takeName()
+}
+
+async function namesCommand($: EngineInterface, text: string) {
+  if (text === '') {
+    const own = await ownNames($)
+
+    return own.length ? `Office names: ${own.join(', ')}` : 'No names set, so each chat picks random ones. Set them with /office names Dave, Sue, Max, Lily'
+  }
+  if (text.toLowerCase() === 'random') {
+    await $.store.delete(NAMES_KEY)
+    nameEveryone([])
+    void publish($)
+
+    return 'Names cleared: each chat now picks random ones.'
+  }
+  // Commas between names, or just spaces when there are none.
+  const own = text
+    .split(text.includes(',') ? ',' : /\s+/)
+    .map(n => n.trim().slice(0, 15))
+    .filter(Boolean)
+  await $.store.set(NAMES_KEY, own)
+  nameEveryone(own)
+  void publish($)
+
+  return `Office names set: ${own.join(', ')}. The first is the lead, the next three the crew. Chats already open pick them up when they next start.`
+}
 
 function findHelper(id: string) {
   return helpers.find(h => h.id === id)
@@ -77,7 +145,9 @@ async function publish($: EngineInterface) {
   if (!lead) return
   const now = Date.now()
   const walking = (p: Person) => now - p.movedAt < WALK_MS
-  const as = (p: Person, id: string, role: Worker['role']): Worker => ({
+  const tick = Math.floor(now / PASTIME_MS)
+  // Steps of 4 through 15 pastimes: nobody shares one with the three after them.
+  const as = (p: Person, id: string, role: Worker['role'], i: number): Worker => ({
     id,
     name: p.name,
     role,
@@ -85,11 +155,14 @@ async function publish($: EngineInterface) {
     atDesk: p.atDesk,
     movedAt: p.movedAt,
     isWalking: walking(p),
+    doing: p.atDesk ? '' : (PASTIMES[(pastimeSeed + tick * 7 + i * 4) % PASTIMES.length] ?? 'Idle'),
   })
-  const next: Board = {
-    folder,
-    workers: [as(lead, 'lead', 'lead'), ...crew.map((c, j) => as(c, `crew${j}`, 'crew')), ...helpers.map(h => as(h, h.id, 'helper'))],
-  }
+  const everyone: [Person, string, Worker['role']][] = [
+    [lead, 'lead', 'lead'],
+    ...crew.map((c, j): [Person, string, Worker['role']] => [c, `crew${j}`, 'crew']),
+    ...helpers.map((h): [Person, string, Worker['role']] => [h, h.id, 'helper']),
+  ]
+  const next: Board = { folder, workers: everyone.map(([p, id, role], i) => as(p, id, role, i)) }
 
   const key = JSON.stringify(next)
   if (key !== lastBoard) {
@@ -257,8 +330,8 @@ function office({ folder, workers }: Board, now: number, width: number) {
     const w = shown[i]
     const live = w?.atDesk && !w.isWalking
     const dot = !w ? '#444441' : w.status === 'error' ? '#E24B4A' : w.atDesk ? '#5DCAA5' : '#888780'
-    const label = w ? esc(w.name.slice(0, 15)) : 'EMPTY OFFICE'
-    const role = w?.role === 'crew' ? 'crew' : w?.role === 'helper' ? 'helper agent' : ''
+    const label = w ? esc(w.name.toUpperCase().slice(0, 15)) : 'EMPTY OFFICE'
+    const role = w ? { lead: 'lead', crew: 'crew', helper: 'helper agent' }[w.role] : ''
     const sub = role ? `<text x="${r.x + 8}" y="${r.y + 23}" class="sub">${role}</text>` : ''
     const plate = `<rect x="${r.x + 4}" y="${r.y + 4}" width="110" height="${sub ? 23 : 13}" fill="#141A2B" opacity=".85"/>`
     // The door is on the hallway side; the plant goes in the far corner.
@@ -353,15 +426,13 @@ ${walkers.join('\n')}
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    await $.command.register({ name: 'office', description: 'Open the pixel office pane' })
+    await $.command.register({ name: 'office', description: 'Open the pixel office pane; /office names Dave, Sue, … sets who works there' })
     const base = e.cwd.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'Claude'
     folder = base.startsWith('scratch-') ? 'Claude' : base
-    // The same chat gets the same people each time it starts.
-    const id = await $.session.id()
-    nextName = [...id].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 0) % NAMES.length
-    lead = person(takeName())
-    crew = CREW_AT.map(() => person(takeName()))
+    lead = person('')
+    crew = CREW_AT.map(() => person(''))
     helpers = []
+    nameEveryone(await ownNames($))
     // Walking in and out of the break room is timed; redraw as people arrive.
     $.clock.every(1000, () => void publish($))
     void publish($)
@@ -370,7 +441,9 @@ export const register: Register = on => {
     return started
   })
 
-  on('command.run', { command: 'office' }, async $ => {
+  on('command.run', { command: 'office' }, async ($, e) => {
+    const args = e.args.trim()
+    if (/^names\b/i.test(args)) return { text: await namesCommand($, args.slice(5).trim()) }
     await $.ui.open({ id: PANE, title: 'Pixel office' })
 
     return { text: 'Pixel office opened.' }
@@ -450,7 +523,7 @@ export const register: Register = on => {
     const chips = workers.map(w => (
       <Text dimColor={!w.atDesk}>
         {w.role === 'lead' ? '■' : '·'} {w.name}
-        {w.role === 'helper' ? ' (helper)' : ''} · {WORDS[w.status]}
+        {w.role === 'helper' ? ' (helper)' : ''} · {w.status === 'idle' && w.doing ? w.doing : WORDS[w.status]}
       </Text>
     ))
     const list = workers.length === 0 ? [<Text dimColor>Nobody's in yet.</Text>] : chips
